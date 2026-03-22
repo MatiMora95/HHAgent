@@ -66,41 +66,40 @@ def reproject_ring(ring: list, prj_wkt: str) -> list:
 def _heuristic_reproject(ring: list, prj_wkt: str) -> list:
     """
     Heuristic reprojection for common US projections when pyproj unavailable.
-    Handles: State Plane (feet), State Plane (meters), UTM.
-    Accurate to ~500m — sufficient for NOAA/HSG point queries.
+    Handles: State Plane (feet/meters), UTM.
+    Uses mid standard parallel for m_lon — accurate to ~200m for CONUS State Plane.
     """
     prj_up = prj_wkt.upper()
 
-    # Convert feet → meters if needed
     is_feet = ("FOOT" in prj_up or "FEET" in prj_up or "US_SURVEY_FOOT" in prj_up)
     FEET_TO_M = 0.3048006096
     ring_m = [(p[0] * FEET_TO_M, p[1] * FEET_TO_M) if is_feet else p for p in ring]
 
-    # Extract projection parameters from PRJ
-    def _extract(pattern, text, default):
+    def _ex(pattern, text, default):
         m = re.search(pattern, text, re.IGNORECASE)
         return float(m.group(1)) if m else default
 
-    cm  = _extract(r'CENTRAL_MERIDIAN[",\s]+(-?\d+\.?\d*)',  prj_wkt, -96.0)
-    lo  = _extract(r'LATITUDE_OF_ORIGIN[",\s]+(\d+\.?\d*)',  prj_wkt,  40.0)
-    fe  = _extract(r'FALSE_EASTING[",\s]+(\d+\.?\d*)',        prj_wkt,   0.0)
-    fn  = _extract(r'FALSE_NORTHING[",\s]+(\d+\.?\d*)',       prj_wkt,   0.0)
+    cm  = _ex(r'CENTRAL_MERIDIAN[",\s]+(-?\d+\.?\d*)',      prj_wkt, -96.0)
+    lo  = _ex(r'LATITUDE_OF_ORIGIN[",\s]+(\d+\.?\d*)',       prj_wkt,  40.0)
+    fe  = _ex(r'FALSE_EASTING[",\s]+(\d+\.?\d*)',             prj_wkt,   0.0)
+    fn  = _ex(r'FALSE_NORTHING[",\s]+(\d+\.?\d*)',            prj_wkt,   0.0)
+    sp1 = _ex(r'STANDARD_PARALLEL_1[",\s]+(\d+\.?\d*)',       prj_wkt,   0.0)
+    sp2 = _ex(r'STANDARD_PARALLEL_2[",\s]+(\d+\.?\d*)',       prj_wkt,   0.0)
 
-    # If feet, scale false easting/northing too
     if is_feet:
         fe *= FEET_TO_M
         fn *= FEET_TO_M
 
-    lat_rad = math.radians(lo)
-    m_per_deg_lat = 111320.0
-    m_per_deg_lon = 111320.0 * math.cos(lat_rad)
+    # Use mid standard parallel for lon scale (more accurate than lat_origin)
+    ref_lat = (sp1 + sp2) / 2 if sp1 and sp2 else lo
+    lat_rad = math.radians(ref_lat)
+    m_lat   = 111320.0
+    m_lon   = 111320.0 * math.cos(lat_rad)
 
     result = []
     for p in ring_m:
-        dx_m = p[0] - fe
-        dy_m = p[1] - fn
-        lon_deg = cm + dx_m / m_per_deg_lon
-        lat_deg = lo + dy_m / m_per_deg_lat
+        lon_deg = cm + (p[0] - fe) / m_lon
+        lat_deg = lo + (p[1] - fn) / m_lat
         result.append((lon_deg, lat_deg))
 
     return result
@@ -244,6 +243,34 @@ DURATIONS      = ["5-min","10-min","15-min","30-min","1-hr","2-hr","3-hr",
                   "6-hr","12-hr","24-hr","48-hr","72-hr"]
 RETURN_PERIODS = [1,2,5,10,25,50,100,200,500,1000]
 
+# Duration in hours — used to convert depth → intensity (depth / duration_hr)
+DURATION_HR = {
+    "5-min":  5/60,
+    "10-min": 10/60,
+    "15-min": 15/60,
+    "30-min": 30/60,
+    "1-hr":   1.0,
+    "2-hr":   2.0,
+    "3-hr":   3.0,
+    "6-hr":   6.0,
+    "12-hr":  12.0,
+    "24-hr":  24.0,
+    "48-hr":  48.0,
+    "72-hr":  72.0,
+}
+
+def _depth_to_intensity(depth_data: dict) -> dict:
+    """Convert depth table (in or mm) → intensity table (in/hr or mm/hr)."""
+    intensity = {}
+    for dur, values in depth_data.items():
+        hr = DURATION_HR.get(dur, 1.0)
+        intensity[dur] = [
+            round(v / hr, 3) if v is not None else None
+            for v in values
+        ]
+    return intensity
+
+
 @app.get("/api/noaa")
 async def get_noaa(lat: float=Query(...), lon: float=Query(...), units: str=Query("english")):
     url = (f"https://hdsc.nws.noaa.gov/pfds/pfds_printpage.html"
@@ -253,23 +280,31 @@ async def get_noaa(lat: float=Query(...), lon: float=Query(...), units: str=Quer
         async with httpx.AsyncClient(timeout=25.0, follow_redirects=True) as client:
             r = await client.get(url, headers={"User-Agent":"Mozilla/5.0 (HydroAgent/2.0)"})
         if r.status_code == 200:
-            data = _parse_noaa_html(r.text)
-            if data:
+            depth_data = _parse_noaa_html(r.text)
+            if depth_data:
+                intensity_data = _depth_to_intensity(depth_data)
                 log.append(f"NOAA Atlas 14 exact data retrieved ✓")
                 return {"source":"NOAA Atlas 14 — PFDS (exact)","estimated":False,
-                        "units":"in" if units=="english" else "mm",
+                        "units":"in/hr" if units=="english" else "mm/hr",
+                        "depth_units":"in" if units=="english" else "mm",
                         "durations":DURATIONS,"return_periods":RETURN_PERIODS,
-                        "data":data,"noaa_url":url,"log":log}
+                        "data":intensity_data,
+                        "depth_data":depth_data,
+                        "noaa_url":url,"log":log}
         log.append(f"NOAA returned HTTP {r.status_code}")
     except Exception as e:
         log.append(f"NOAA unreachable: {str(e)[:60]}")
 
-    data = _estimate_idf(lat, lon, units)
+    depth_data = _estimate_idf(lat, lon, units)
+    intensity_data = _depth_to_intensity(depth_data)
     log.append("Regional IDF estimation applied")
     return {"source":"Regional estimate — see NOAA link for exact data","estimated":True,
-            "units":"in" if units=="english" else "mm",
+            "units":"in/hr" if units=="english" else "mm/hr",
+            "depth_units":"in" if units=="english" else "mm",
             "durations":DURATIONS,"return_periods":RETURN_PERIODS,
-            "data":data,"noaa_url":url,"log":log}
+            "data":intensity_data,
+            "depth_data":depth_data,
+            "noaa_url":url,"log":log}
 
 
 def _parse_noaa_html(html: str) -> Optional[dict]:
@@ -330,70 +365,151 @@ def _estimate_idf(lat, lon, units) -> dict:
 # ════════════════════════════════════════════════════════
 
 HSG_INFO = {
-    "A":  ("Low runoff — high infiltration. Deep, well-drained sandy or gravelly soils.","30–45"),
-    "B":  ("Moderate runoff — moderate infiltration. Moderately deep well-drained soils.","55–70"),
-    "C":  ("High runoff — slow infiltration. Layer impeding downward water movement.","70–80"),
-    "D":  ("Very high runoff — very slow infiltration. Clay-rich or high water table.","80–90"),
-    "B/D":("Dual group (drained B / undrained D). Evaluate both conditions.","55–90"),
-    "C/D":("Dual group (drained C / undrained D). Evaluate both conditions.","70–90"),
+    "A":  ("Low runoff potential. High infiltration rate. Deep, well-drained sandy or gravelly soils. Transmission rate > 0.30 in/hr.", "30–45"),
+    "B":  ("Moderately low runoff potential. Moderate infiltration rate. Moderately deep, well-drained soils with moderate to fine texture. Transmission 0.15–0.30 in/hr.", "55–70"),
+    "C":  ("Moderately high runoff potential. Slow infiltration rate. Soils with a layer that impedes downward water movement or moderately fine texture. Transmission 0.05–0.15 in/hr.", "70–80"),
+    "D":  ("High runoff potential. Very slow infiltration rate. Clays with high shrink-swell potential, soils with high water table, or shallow soils over impervious material. Transmission < 0.05 in/hr.", "80–90"),
+    "B/D":("Dual hydrologic group. Drained condition = B. Undrained condition = D. Evaluate both for NRCS method.", "55–90"),
+    "C/D":("Dual hydrologic group. Drained condition = C. Undrained condition = D. Evaluate both for NRCS method.", "70–90"),
 }
 
 @app.get("/api/hsg")
 async def get_hsg(lat: float=Query(...), lon: float=Query(...)):
     log = []
-    # Attempt 1: USDA SDA
-    query = f"""SELECT TOP 5 mu.muname,c.hydgrp,c.comppct_r,c.compname,c.taxorder
-        FROM mapunit mu JOIN component c ON mu.mukey=c.mukey
-        WHERE mu.mukey IN (SELECT * FROM SDA_Get_Mukey_from_intersection_with_WktWgs84('POINT({lon} {lat})'))
-        AND c.majcompflag='Yes' ORDER BY c.comppct_r DESC"""
+
+    # Web Soil Survey PDF report URL (always include regardless of data source)
+    wss_report_url = (
+        f"https://websoilsurvey.sc.egov.usda.gov/App/WebSoilSurvey.aspx"
+        f"?action=GetSoilReport&lat={lat}&lon={lon}"
+    )
+    # Simpler direct WSS URL that works as a link
+    wss_url = "https://websoilsurvey.sc.egov.usda.gov/App/WebSoilSurvey.aspx"
+
+    # Attempt 1: USDA SDA — extended query with more soil properties
+    query = f"""SELECT TOP 10
+        mu.muname, mu.mukey,
+        c.hydgrp, c.comppct_r, c.compname, c.taxorder, c.taxsuborder,
+        c.drainagecl, c.hydricrating,
+        c.taxclname
+    FROM mapunit mu
+    JOIN component c ON mu.mukey = c.mukey
+    WHERE mu.mukey IN (
+        SELECT * FROM SDA_Get_Mukey_from_intersection_with_WktWgs84('POINT({lon} {lat})')
+    )
+    AND c.majcompflag = 'Yes'
+    ORDER BY c.comppct_r DESC"""
+
     try:
         async with httpx.AsyncClient(timeout=20.0) as client:
-            r = await client.post("https://sdmdataaccess.sc.egov.usda.gov/Tabular/post.rest",
-                data={"query":query,"format":"JSON+COLUMNNAME+METADATA"},
-                headers={"Content-Type":"application/x-www-form-urlencoded"})
+            r = await client.post(
+                "https://sdmdataaccess.sc.egov.usda.gov/Tabular/post.rest",
+                data={"query": query, "format": "JSON+COLUMNNAME+METADATA"},
+                headers={"Content-Type": "application/x-www-form-urlencoded"}
+            )
         if r.status_code == 200:
-            table = r.json().get("Table",[])
+            table = r.json().get("Table", [])
             if len(table) > 1:
                 rows = table[1:]
-                d    = rows[0]
-                comps= [{"muname":rw[0],"hsg":rw[1],"pct":rw[2],"compname":rw[3]} for rw in rows if rw[1]]
-                log.append(f"USDA SDA: {len(comps)} component(s) ✓")
-                return _hsg_resp(d[1] or "B", d[0] or "", d[3] or "", d[2] or 0, comps, False, log)
-    except Exception as e:
-        log.append(f"SDA error: {str(e)[:50]}")
+                d = rows[0]
+                # cols: muname, mukey, hydgrp, comppct_r, compname, taxorder,
+                #       taxsuborder, drainagecl, hydricrating, taxclname
+                hsg        = d[2] or "B"
+                muname     = d[0] or ""
+                mukey      = d[1] or ""
+                compname   = d[4] or ""
+                taxorder   = d[5] or ""
+                taxsuborder= d[6] or ""
+                drainage   = d[7] or ""
+                hydric     = d[8] or ""
+                taxclass   = d[9] or ""
+                pct        = d[3] or 0
 
-    # Attempt 2: SoilWeb
+                comps = [{
+                    "muname":   rw[0], "hsg": rw[2], "pct": rw[3],
+                    "compname": rw[4], "taxorder": rw[5],
+                    "drainage": rw[7], "hydric": rw[8]
+                } for rw in rows if rw[2]]
+
+                # Build WSS link with mukey for direct report
+                wss_direct = f"https://websoilsurvey.sc.egov.usda.gov/App/WebSoilSurvey.aspx"
+                log.append(f"USDA SDA: {len(comps)} component(s) found ✓")
+
+                return _hsg_resp(
+                    hsg, muname, compname, taxorder, taxsuborder,
+                    drainage, hydric, taxclass, pct, comps,
+                    False, log, "", wss_direct, lat, lon
+                )
+    except Exception as e:
+        log.append(f"SDA error: {str(e)[:60]} — trying SoilWeb")
+
+    # Attempt 2: SoilWeb (UC Davis)
     try:
         async with httpx.AsyncClient(timeout=12.0) as client:
-            r = await client.get(f"https://casoilresource.lawr.ucdavis.edu/api/soil-series/?lon={lon}&lat={lat}&outformat=json")
+            r = await client.get(
+                f"https://casoilresource.lawr.ucdavis.edu/api/soil-series/"
+                f"?lon={lon}&lat={lat}&outformat=json"
+            )
         if r.status_code == 200:
-            sw = r.json()
-            hsg= _drain_to_hsg(sw.get("drainage_class",""))
-            log.append(f"SoilWeb: {sw.get('series_name','')} ✓")
-            return _hsg_resp(hsg, sw.get("series_name",""), "", None, [], True, log, "Source: SoilWeb/UC Davis")
+            sw  = r.json()
+            hsg = _drain_to_hsg(sw.get("drainage_class", ""))
+            log.append(f"SoilWeb: series={sw.get('series_name','')} ✓")
+            return _hsg_resp(
+                hsg, sw.get("series_name",""), sw.get("series_name",""),
+                "", "", sw.get("drainage_class",""), "", "", None,
+                [], True, log, "Source: SoilWeb / UC Davis", wss_url, lat, lon
+            )
     except Exception as e:
-        log.append(f"SoilWeb error: {str(e)[:40]}")
+        log.append(f"SoilWeb error: {str(e)[:40]} — using geographic estimate")
 
     # Attempt 3: geographic estimate
-    hsg = "B" if lon < -100 else ("B" if lat < 33 and lon > -90 else "B")
+    hsg = "B"
     log.append("Geographic estimate applied")
-    return _hsg_resp(hsg,"Geographic estimate","",None,[],True,log,"Estimated from regional patterns")
+    return _hsg_resp(
+        hsg, "Geographic estimate", "", "", "", "", "", "", None,
+        [], True, log, "Estimated — open Web Soil Survey for exact data",
+        wss_url, lat, lon
+    )
 
 
 def _drain_to_hsg(d):
-    d=d.lower()
+    d = d.lower()
     if "excessively" in d: return "A"
+    if "somewhat excessively" in d: return "A"
     if "well" in d: return "B"
     if "moderately well" in d: return "B"
     if "somewhat poorly" in d: return "C"
-    if "poorly" in d: return "D"
+    if "poorly" in d or "very poorly" in d: return "D"
     return "B"
 
-def _hsg_resp(hsg, muname, compname, pct, comps, estimated, log, note=""):
+def _hsg_resp(hsg, muname, compname, taxorder, taxsuborder,
+              drainage, hydric, taxclass, pct, comps,
+              estimated, log, note, wss_url, lat, lon):
     info = HSG_INFO.get(hsg, HSG_INFO.get(hsg[0] if hsg else "B", ("Unknown","—")))
-    return {"hsg":hsg,"muname":muname,"compname":compname,"pct_dominant":pct,
-            "description":info[0],"cn_range":info[1],"components":comps,
-            "estimated":estimated,"note":note,"log":log}
+    # Build direct WSS PDF bookmark URL
+    wss_pdf_url = (
+        f"https://websoilsurvey.sc.egov.usda.gov/App/WebSoilSurvey.aspx"
+    )
+    return {
+        "hsg":          hsg,
+        "muname":       muname,
+        "compname":     compname,
+        "taxorder":     taxorder,
+        "taxsuborder":  taxsuborder,
+        "drainage_class": drainage,
+        "hydric_rating":  hydric,
+        "tax_class":    taxclass,
+        "pct_dominant": pct,
+        "description":  info[0],
+        "cn_range":     info[1],
+        "components":   comps,
+        "estimated":    estimated,
+        "note":         note,
+        "wss_url":      wss_url,
+        "wss_pdf_url":  wss_pdf_url,
+        "lat":          lat,
+        "lon":          lon,
+        "log":          log
+    }
 
 
 # ════════════════════════════════════════════════════════
@@ -417,3 +533,271 @@ async def get_tr55(lat: float=Query(...), lon: float=Query(...)):
     return {"type":"Type II","region":"Central & Eastern US — most of CONUS east of Rockies","segment":3,
             "tip":"Most common distribution. Concentrated peak ~hour 12. Select Type II in Storm & Sanitary.",
             "peak_hr":12,"factor":0.42,"ss_input":"II"}
+
+
+# ════════════════════════════════════════════════════════
+#  SOIL REPORT — full SSURGO data → HTML/PDF
+# ════════════════════════════════════════════════════════
+
+@app.get("/api/soil-report")
+async def soil_report(lat: float=Query(...), lon: float=Query(...)):
+    """
+    Fetch comprehensive soil data from USDA SDA and return
+    a full HTML report (printable as PDF from browser).
+    """
+    from fastapi.responses import HTMLResponse
+    from datetime import datetime
+
+    # ── Query 1: Component data ──────────────────────────────────────────────
+    q_comp = f"""
+    SELECT
+        mu.muname, mu.mukey, mu.musym,
+        c.compname, c.comppct_r, c.majcompflag,
+        c.hydgrp, c.drainagecl, c.hydricrating,
+        c.taxorder, c.taxsuborder, c.taxgrtgroup, c.taxsubgrp,
+        c.taxclname, c.slope_r, c.slope_l, c.slope_h,
+        c.elev_r, c.aspectrep,
+        c.tfact, c.wei, c.weg,
+        c.nirrcapcl, c.nirrcapscl,
+        c.irrcapcl,  c.irrcapscl
+    FROM mapunit mu
+    JOIN component c ON mu.mukey = c.mukey
+    WHERE mu.mukey IN (
+        SELECT * FROM SDA_Get_Mukey_from_intersection_with_WktWgs84('POINT({lon} {lat})')
+    )
+    ORDER BY c.comppct_r DESC"""
+
+    # ── Query 2: Horizon data for dominant component ─────────────────────────
+    q_horiz = f"""
+    SELECT TOP 20
+        c.compname, c.comppct_r,
+        h.hzname, h.hzdept_r, h.hzdepb_r,
+        h.texture, h.texdesc,
+        h.sandtotal_r, h.silttotal_r, h.claytotal_r,
+        h.om_r, h.ph1to1h2o_r,
+        h.ksat_r, h.awc_r,
+        h.dbthirdbar_r,
+        h.cec7_r
+    FROM mapunit mu
+    JOIN component c ON mu.mukey = c.mukey
+    JOIN chorizon h  ON c.cokey  = h.cokey
+    WHERE mu.mukey IN (
+        SELECT * FROM SDA_Get_Mukey_from_intersection_with_WktWgs84('POINT({lon} {lat})')
+    )
+    AND c.majcompflag = 'Yes'
+    ORDER BY c.comppct_r DESC, h.hzdept_r ASC"""
+
+    # ── Query 3: Land capability and interpretations ─────────────────────────
+    q_interp = f"""
+    SELECT TOP 10
+        c.compname, c.comppct_r,
+        ci.rulename, ci.interphrc, ci.interphr
+    FROM mapunit mu
+    JOIN component c    ON mu.mukey  = c.mukey
+    JOIN cointerp ci    ON c.cokey   = ci.cokey
+    WHERE mu.mukey IN (
+        SELECT * FROM SDA_Get_Mukey_from_intersection_with_WktWgs84('POINT({lon} {lat})')
+    )
+    AND c.majcompflag = 'Yes'
+    AND ci.mrulename IN (
+        'NRCS Irrigation Suitability',
+        'Hydrologic Soil Group',
+        'Flooding Frequency Class',
+        'Ponding Frequency Class',
+        'Depth to Restrictive Layer',
+        'Shrink-Swell Potential',
+        'Corrosion of Steel',
+        'Corrosion of Concrete'
+    )
+    ORDER BY c.comppct_r DESC, ci.rulename"""
+
+    SDA = "https://sdmdataaccess.sc.egov.usda.gov/Tabular/post.rest"
+    headers = {"Content-Type": "application/x-www-form-urlencoded"}
+
+    comp_rows, horiz_rows, interp_rows = [], [], []
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        try:
+            r = await client.post(SDA, data={"query":q_comp,"format":"JSON+COLUMNNAME+METADATA"}, headers=headers)
+            if r.status_code == 200:
+                t = r.json().get("Table", [])
+                comp_rows = t[1:] if len(t) > 1 else []
+        except Exception: pass
+
+        try:
+            r = await client.post(SDA, data={"query":q_horiz,"format":"JSON+COLUMNNAME+METADATA"}, headers=headers)
+            if r.status_code == 200:
+                t = r.json().get("Table", [])
+                horiz_rows = t[1:] if len(t) > 1 else []
+        except Exception: pass
+
+        try:
+            r = await client.post(SDA, data={"query":q_interp,"format":"JSON+COLUMNNAME+METADATA"}, headers=headers)
+            if r.status_code == 200:
+                t = r.json().get("Table", [])
+                interp_rows = t[1:] if len(t) > 1 else []
+        except Exception: pass
+
+    # ── Build HTML report ────────────────────────────────────────────────────
+    now   = datetime.now().strftime("%B %d, %Y  %H:%M")
+    muname= comp_rows[0][0] if comp_rows else "Unknown"
+    musym = comp_rows[0][2] if comp_rows else "—"
+
+    def safe(v, suffix="", decimals=None):
+        if v is None or v == "": return "—"
+        if decimals is not None:
+            try: return f"{float(v):.{decimals}f}{suffix}"
+            except: pass
+        return str(v) + suffix
+
+    def hdr(cols):
+        return "<tr>" + "".join(f"<th>{c}</th>" for c in cols) + "</tr>"
+
+    def row(cells):
+        return "<tr>" + "".join(f"<td>{safe(c)}</td>" for c in cells) + "</tr>"
+
+    # Component table
+    comp_html = ""
+    if comp_rows:
+        comp_html = f"""
+        <table>
+          {hdr(["Component","Symbol","%","HSG","Drainage","Hydric","Tax. Order","Tax. Class","LCC (irr.)","LCC (non-irr.)","Slope (%)"])}
+          {"".join(row([r[3],r[2],safe(r[4],"%"),safe(r[6]),safe(r[7]),safe(r[8]),safe(r[9]),safe(r[13]),
+                        f"{safe(r[22])}{safe(r[23])}",f"{safe(r[20])}{safe(r[21])}",
+                        f"{safe(r[14],decimals=1)}–{safe(r[16],decimals=1)}"]) for r in comp_rows[:8])}
+        </table>"""
+
+    # Horizon table
+    horiz_html = ""
+    if horiz_rows:
+        horiz_html = f"""
+        <table>
+          {hdr(["Horizon","Depth top (cm)","Depth bot (cm)","Texture","Sand %","Silt %","Clay %",
+                "OM %","pH","Ksat (µm/s)","AWC (in/in)","Bulk density","CEC"])}
+          {"".join(row([r[2],safe(r[3]),safe(r[4]),safe(r[5]),safe(r[8],decimals=1),safe(r[9],decimals=1),
+                        safe(r[10],decimals=1),safe(r[11],decimals=2),safe(r[12],decimals=1),
+                        safe(r[13],decimals=3),safe(r[14],decimals=3),safe(r[15],decimals=2),safe(r[16],decimals=1)]) for r in horiz_rows)}
+        </table>"""
+
+    # Interpretations table
+    interp_html = ""
+    if interp_rows:
+        interp_html = f"""
+        <table>
+          {hdr(["Interpretation","Rating class","Rating value"])}
+          {"".join(row([r[2],safe(r[3]),safe(r[4],decimals=2)]) for r in interp_rows)}
+        </table>"""
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Soil Report — {muname}</title>
+<style>
+  @media print {{
+    body {{ margin: 0; }}
+    .no-print {{ display: none; }}
+    h2 {{ page-break-before: always; }}
+    h2:first-of-type {{ page-break-before: avoid; }}
+  }}
+  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  body {{ font-family: Arial, sans-serif; font-size: 11px; color: #1a1a1a;
+          background: #fff; padding: 28px 36px; max-width: 960px; margin: 0 auto; }}
+  .cover {{ border-bottom: 3px solid #1a5c38; margin-bottom: 20px; padding-bottom: 14px; }}
+  .cover h1 {{ font-size: 20px; color: #1a5c38; margin-bottom: 4px; }}
+  .cover .sub {{ font-size: 12px; color: #555; }}
+  .meta-grid {{ display: grid; grid-template-columns: repeat(4,1fr); gap: 10px;
+                background: #f4f8f5; border: 1px solid #c8ddd0; border-radius: 4px;
+                padding: 12px; margin: 16px 0; }}
+  .meta-item .ml {{ font-size: 9px; color: #777; text-transform: uppercase;
+                    letter-spacing: .06em; margin-bottom: 2px; }}
+  .meta-item .mv {{ font-size: 13px; font-weight: 700; color: #1a5c38; }}
+  h2 {{ font-size: 13px; color: #fff; background: #1a5c38; padding: 6px 12px;
+        margin: 20px 0 8px; border-radius: 3px; }}
+  h3 {{ font-size: 11px; color: #1a5c38; margin: 12px 0 5px; font-weight: 700; }}
+  table {{ width: 100%; border-collapse: collapse; margin-bottom: 10px; font-size: 10px; }}
+  th {{ background: #2e7d52; color: #fff; padding: 5px 7px; text-align: left;
+        font-weight: 600; white-space: nowrap; }}
+  td {{ padding: 4px 7px; border-bottom: 1px solid #e0e8e3; vertical-align: top; }}
+  tr:nth-child(even) td {{ background: #f6faf7; }}
+  .hsg-box {{ display: inline-block; width: 54px; height: 54px; border-radius: 50%;
+              border: 3px solid #1a5c38; text-align: center; line-height: 48px;
+              font-size: 26px; font-weight: 700; margin-right: 16px; vertical-align: middle; }}
+  .hA {{ background:#d4edda;color:#145a32; }}
+  .hB {{ background:#cce5ff;color:#0c407a; }}
+  .hC {{ background:#fff3cd;color:#7a5300; }}
+  .hD {{ background:#f8d7da;color:#721c24; }}
+  .hsg-info {{ display: inline-block; vertical-align: middle; max-width: 75%; }}
+  .hsg-info p {{ font-size: 11px; color: #444; margin-top: 4px; line-height: 1.5; }}
+  .note {{ font-size: 10px; color: #777; border-left: 3px solid #2e7d52; padding-left: 8px;
+           margin: 10px 0; line-height: 1.6; }}
+  .print-btn {{ position: fixed; top: 18px; right: 18px;
+                background: #1a5c38; color: #fff; border: none;
+                padding: 10px 18px; font-size: 12px; border-radius: 4px;
+                cursor: pointer; font-family: Arial; }}
+  .print-btn:hover {{ background: #145030; }}
+  footer {{ margin-top: 28px; padding-top: 10px; border-top: 1px solid #ccc;
+            font-size: 9px; color: #999; }}
+</style>
+</head>
+<body>
+
+<button class="print-btn no-print" onclick="window.print()">🖨 Print / Save PDF</button>
+
+<div class="cover">
+  <h1>Soil Survey Report — {muname}</h1>
+  <div class="sub">Generated by HydroAgent · USDA SSURGO Database · {now}</div>
+</div>
+
+<div class="meta-grid">
+  <div class="meta-item"><div class="ml">Latitude</div><div class="mv">{lat:.5f}°N</div></div>
+  <div class="meta-item"><div class="ml">Longitude</div><div class="mv">{abs(lon):.5f}°W</div></div>
+  <div class="meta-item"><div class="ml">Map Unit</div><div class="mv">{musym}</div></div>
+  <div class="meta-item"><div class="ml">Report Date</div><div class="mv">{datetime.now().strftime('%Y-%m-%d')}</div></div>
+</div>
+
+<h2>1 — Hydrologic Soil Group (HSG)</h2>
+{"".join([f'''
+<div style="margin-bottom:14px">
+  <span class="hsg-box h{r[6][0] if r[6] else "B"}">{r[6] or "—"}</span>
+  <div class="hsg-info">
+    <strong>{r[3]} ({safe(r[4])}%)</strong>
+    <p>Drainage: {safe(r[7])} &nbsp;|&nbsp; Hydric: {safe(r[8])} &nbsp;|&nbsp; Tax. order: {safe(r[9])}</p>
+    <p>Taxonomic class: {safe(r[13])}</p>
+  </div>
+</div>
+''' for r in comp_rows[:3]]) if comp_rows else "<p>No HSG data retrieved.</p>"}
+
+<div class="note">
+  <strong>HSG Reference (USDA-NRCS TR-55):</strong><br>
+  Group A — High infiltration rate (&gt;0.30 in/hr). Sandy, gravelly. CN: 30–45<br>
+  Group B — Moderate infiltration (0.15–0.30 in/hr). Moderately textured. CN: 55–70<br>
+  Group C — Slow infiltration (0.05–0.15 in/hr). Layer impeding movement. CN: 70–80<br>
+  Group D — Very slow infiltration (&lt;0.05 in/hr). Clay-rich or high WT. CN: 80–90
+</div>
+
+<h2>2 — Soil Components</h2>
+{comp_html or "<p>No component data retrieved.</p>"}
+
+<h2>3 — Soil Horizons (Dominant Component)</h2>
+{horiz_html or "<p>No horizon data retrieved.</p>"}
+<div class="note">Ksat = Saturated Hydraulic Conductivity (µm/s) &nbsp;|&nbsp; AWC = Available Water Capacity (in/in) &nbsp;|&nbsp; OM = Organic Matter &nbsp;|&nbsp; CEC = Cation Exchange Capacity (meq/100g)</div>
+
+<h2>4 — Soil Interpretations</h2>
+{interp_html or "<p>No interpretation data retrieved.</p>"}
+
+<h2>5 — Data Sources &amp; References</h2>
+<div class="note">
+  <strong>Database:</strong> USDA-NRCS SSURGO (Soil Survey Geographic Database), accessed via Soil Data Access (SDA) REST API.<br>
+  <strong>Web Soil Survey:</strong> <a href="https://websoilsurvey.sc.egov.usda.gov">websoilsurvey.sc.egov.usda.gov</a><br>
+  <strong>Coordinates:</strong> {lat:.5f}°N, {abs(lon):.5f}°W (WGS84)<br>
+  <strong>Note:</strong> Values shown are representative (median) values from SSURGO. Low and high values may differ.
+  Always verify against the official Web Soil Survey for final design.
+</div>
+
+<footer>HydroAgent · USDA SSURGO · Report generated {now} · Coordinates: {lat:.5f}°N, {abs(lon):.5f}°W</footer>
+</body>
+</html>"""
+
+    return HTMLResponse(content=html, media_type="text/html")
+

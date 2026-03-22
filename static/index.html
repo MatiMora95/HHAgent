@@ -243,6 +243,21 @@ header{position:relative;z-index:10;background:var(--ink);color:#fff;padding:0 3
         <div class="card-body">
           <div class="card-empty" id="noaaEmpty">Run analysis to load IDF data</div>
           <div id="noaaRes" style="display:none">
+            <!-- Toggle intensity / depth -->
+            <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px">
+              <span style="font-family:var(--fm);font-size:10px;color:var(--mid)">Display:</span>
+              <div style="display:flex;border:1px solid var(--rule);border-radius:3px;overflow:hidden">
+                <button id="btnIntensity" onclick="switchTable('intensity')"
+                  style="padding:4px 12px;font-family:var(--fm);font-size:10px;border:none;cursor:pointer;background:var(--ink);color:#fff">
+                  Intensity (in/hr)
+                </button>
+                <button id="btnDepth" onclick="switchTable('depth')"
+                  style="padding:4px 12px;font-family:var(--fm);font-size:10px;border:none;cursor:pointer;background:#fff;color:var(--mid)">
+                  Depth (in)
+                </button>
+              </div>
+              <span id="tableLabel" style="font-family:var(--fm);font-size:10px;color:var(--acc);font-weight:600"></span>
+            </div>
             <div class="tbl-wrap"><table class="idf" id="idfTbl"></table></div>
             <div class="noaa-note" id="noaaNote"></div>
             <a class="noaa-link" id="noaaLink" href="#" target="_blank">Open exact NOAA PFDS page for this location ↗</a>
@@ -264,6 +279,14 @@ header{position:relative;z-index:10;background:var(--ink);color:#fff;padding:0 3
             <div class="hsg-series" id="hsgSeries">—</div>
             <div class="hsg-desc" id="hsgDesc">—</div>
             <div style="font-size:10px;color:var(--mid);font-family:var(--fm)" id="hsgCN">—</div>
+            <div id="hsgDetail" style="width:100%;margin-top:8px"></div>
+            <table class="idf" id="hsgCompsTbl" style="display:none;margin-top:8px;width:100%">
+              <tr>
+                <th style="text-align:left">Component</th>
+                <th>HSG</th><th>%</th><th>Drainage</th>
+              </tr>
+            </table>
+            <div id="hsgWSSLinks" style="margin-top:10px;display:flex;flex-wrap:wrap;gap:6px"></div>
           </div>
         </div>
       </div>
@@ -442,24 +465,89 @@ async function runNOAA(){
     renderNOAA(d);
   }catch(e){log('NOAA error: '+e.message,'err');}
 }
+
+// Store both tables for toggle
+window._noaaIntensity = null;
+window._noaaDepth     = null;
+window._noaaUnits     = {intensity:'in/hr', depth:'in'};
+
 function renderNOAA(d){
-  const DURS=d.durations||["5-min","10-min","15-min","30-min","1-hr","2-hr","3-hr","6-hr","12-hr","24-hr","48-hr","72-hr"];
-  const RPS=d.return_periods||[1,2,5,10,25,50,100,200,500,1000];
-  const u=d.units||'in';
-  const tbl=$('idfTbl');tbl.innerHTML='';
-  const hr=tbl.createTHead().insertRow();
-  const h0=document.createElement('th');h0.textContent='Duration';h0.className='dur';hr.appendChild(h0);
-  RPS.forEach(rp=>{const th=document.createElement('th');th.textContent=rp+'yr';if([10,25,100].includes(rp))th.className='hi';hr.appendChild(th);});
-  const tb=tbl.createTBody();
-  DURS.forEach(dur=>{
-    const row=tb.insertRow(),td0=row.insertCell();td0.className='dur';td0.textContent=dur;
-    (d.data[dur]||[]).forEach((v,i)=>{const td=row.insertCell();td.textContent=v!=null?`${v} ${u}`:'—';if([10,25,100].includes(RPS[i]))td.className='hi';});
+  const DURS = d.durations || ["5-min","10-min","15-min","30-min","1-hr","2-hr","3-hr","6-hr","12-hr","24-hr","48-hr","72-hr"];
+  const RPS  = d.return_periods || [1,2,5,10,25,50,100,200,500,1000];
+
+  // Store both tables
+  window._noaaIntensity = d.data;        // in/hr (default)
+  window._noaaDepth     = d.depth_data;  // in
+  window._noaaRPS       = RPS;
+  window._noaaDURS      = DURS;
+
+  // Unit labels
+  const isMetric = S.units === 'metric';
+  window._noaaUnits = {
+    intensity: isMetric ? 'mm/hr' : 'in/hr',
+    depth:     isMetric ? 'mm'    : 'in'
+  };
+
+  // Render intensity by default
+  buildIdfTable('intensity');
+
+  $('noaaNote').textContent =
+    `Intensity values (${window._noaaUnits.intensity}) = depth ÷ duration. `+
+    `Use 24-hr row × design return period in Storm & Sanitary.`+
+    (d.estimated ? ' * Estimated — open NOAA link for exact values.' : '');
+  $('noaaLink').href = d.noaa_url;
+  $('tableLabel').textContent = window._noaaUnits.intensity;
+  $('noaaEmpty').style.display = 'none';
+  $('noaaRes').style.display   = 'block';
+  $('noaaBadge').textContent   = d.estimated ? '⚠ Estimated' : '✓ Atlas 14 exact';
+  $('noaaBadge').className     = d.estimated ? 'badge bk-est' : 'badge bk-ok';
+}
+
+function buildIdfTable(mode){
+  const tableData = mode === 'intensity' ? window._noaaIntensity : window._noaaDepth;
+  const u         = window._noaaUnits[mode];
+  const DURS      = window._noaaDURS;
+  const RPS       = window._noaaRPS;
+  if(!tableData) return;
+
+  const tbl = $('idfTbl'); tbl.innerHTML = '';
+  const hr  = tbl.createTHead().insertRow();
+  const h0  = document.createElement('th');
+  h0.textContent = 'Duration'; h0.className = 'dur'; hr.appendChild(h0);
+  RPS.forEach(rp => {
+    const th = document.createElement('th');
+    th.textContent = rp + 'yr';
+    if([10,25,100].includes(rp)) th.className = 'hi';
+    hr.appendChild(th);
   });
-  $('noaaNote').textContent=`Depth values (${u}). Use 24-hr row × design return period in Storm & Sanitary.${d.estimated?' * Estimated — open NOAA link for exact values.':''}`;
-  $('noaaLink').href=d.noaa_url;
-  $('noaaEmpty').style.display='none';$('noaaRes').style.display='block';
-  $('noaaBadge').textContent=d.estimated?'⚠ Estimated':'✓ Atlas 14 exact';
-  $('noaaBadge').className=d.estimated?'badge bk-est':'badge bk-ok';
+  const tb = tbl.createTBody();
+  DURS.forEach(dur => {
+    const row = tb.insertRow();
+    const td0 = row.insertCell(); td0.className = 'dur'; td0.textContent = dur;
+    (tableData[dur] || []).forEach((v, i) => {
+      const td = row.insertCell();
+      td.textContent = v != null ? `${v} ${u}` : '—';
+      if([10,25,100].includes(RPS[i])) td.className = 'hi';
+    });
+  });
+}
+
+function switchTable(mode){
+  buildIdfTable(mode);
+  const u = window._noaaUnits[mode];
+  $('tableLabel').textContent = u;
+  // Toggle button styles
+  const isIntensity = mode === 'intensity';
+  $('btnIntensity').style.background = isIntensity ? 'var(--ink)' : '#fff';
+  $('btnIntensity').style.color      = isIntensity ? '#fff'       : 'var(--mid)';
+  $('btnDepth').style.background     = isIntensity ? '#fff'       : 'var(--ink)';
+  $('btnDepth').style.color          = isIntensity ? 'var(--mid)' : '#fff';
+  // Update note
+  if(mode === 'intensity'){
+    $('noaaNote').textContent = `Intensity (${u}) = depth ÷ duration. Use 24-hr row × design RP in Storm & Sanitary.`;
+  } else {
+    $('noaaNote').textContent = `Depth values (${u}) from NOAA Atlas 14 Partial Duration Series.`;
+  }
 }
 
 // ── HSG ──────────────────────────────────────────────
@@ -474,14 +562,79 @@ async function runHSG(){
   }catch(e){log('HSG error: '+e.message,'err');}
 }
 function renderHSG(d){
-  const g=d.hsg||'B',main=g[0];
-  const ring=$('hsgRing');ring.textContent=g;ring.className='hsg-ring h'+main;
-  $('hsgSeries').textContent=(d.estimated?'⚠ est. — ':'')+d.muname;
-  $('hsgDesc').textContent=d.description||'—';
-  $('hsgCN').textContent='Typical CN range: '+(d.cn_range||'—');
-  $('hsgEmpty').style.display='none';$('hsgRes').style.display='flex';
-  $('hsgBadge').textContent=d.estimated?'⚠ Estimated':'✓ SSURGO';
-  $('hsgBadge').className=d.estimated?'badge bk-est':'badge bk-ok';
+  const g=d.hsg||'B', main=g[0];
+  const ring=$('hsgRing');
+  ring.textContent=g;
+  ring.className='hsg-ring h'+main;
+
+  $('hsgSeries').textContent = (d.estimated ? '⚠ est. — ' : '') + (d.muname || '—');
+  $('hsgDesc').textContent   = d.description || '—';
+  $('hsgCN').textContent     = 'Typical CN range: ' + (d.cn_range || '—');
+
+  // Extended soil detail
+  const detEl = $('hsgDetail');
+  detEl.innerHTML = '';
+  const rows = [
+    ['Component',    d.compname    || '—'],
+    ['Tax. order',   d.taxorder    || '—'],
+    ['Tax. suborder',d.taxsuborder || '—'],
+    ['Drainage class', d.drainage_class || '—'],
+    ['Hydric rating',  d.hydric_rating  || '—'],
+    ['Tax. class',   d.tax_class   || '—'],
+    ['Dominant %',   d.pct_dominant != null ? d.pct_dominant + '%' : '—'],
+  ];
+  rows.forEach(([label, val]) => {
+    if (val === '—') return;
+    detEl.insertAdjacentHTML('beforeend',
+      `<div style="display:flex;justify-content:space-between;padding:3px 0;border-bottom:0.5px solid var(--rule)">
+         <span style="font-size:10px;color:var(--mid);font-family:var(--fm)">${label}</span>
+         <span style="font-size:10px;font-weight:500;font-family:var(--fm);text-align:right;max-width:55%">${val}</span>
+       </div>`
+    );
+  });
+
+  // Components table
+  const comps = d.components || [];
+  const ct = $('hsgCompsTbl');
+  if (comps.length > 1) {
+    ct.style.display = 'table';
+    while (ct.rows.length > 1) ct.deleteRow(1);
+    comps.slice(0,6).forEach(c => {
+      const row = ct.insertRow();
+      [c.compname||c.muname, c.hsg||'—', c.pct+'%', c.drainage||'—'].forEach(v => {
+        const td = row.insertCell(); td.textContent = v;
+      });
+    });
+  }
+
+  // WSS buttons
+  const wssEl = $('hsgWSSLinks');
+  wssEl.innerHTML = '';
+
+  // Primary: Full soil report (opens in new tab → Print → Save as PDF)
+  if (d.lat && d.lon) {
+    const reportUrl = `/api/soil-report?lat=${d.lat}&lon=${d.lon}`;
+    wssEl.insertAdjacentHTML('beforeend',
+      `<a href="${reportUrl}" target="_blank"
+          style="display:inline-flex;align-items:center;gap:6px;padding:7px 14px;
+                 background:var(--acc);color:#fff;border-radius:3px;text-decoration:none;
+                 font-family:var(--fm);font-size:11px;letter-spacing:.5px;font-weight:600">
+         📄 Download Soil Report (PDF)
+       </a>`
+    );
+  }
+
+  // Secondary: Web Soil Survey link
+  wssEl.insertAdjacentHTML('beforeend',
+    `<a href="https://websoilsurvey.sc.egov.usda.gov" target="_blank" class="noaa-link">
+       🌐 Web Soil Survey ↗
+     </a>`
+  );
+
+  $('hsgEmpty').style.display = 'none';
+  $('hsgRes').style.display   = 'flex';
+  $('hsgBadge').textContent   = d.estimated ? '⚠ Estimated' : '✓ SSURGO';
+  $('hsgBadge').className     = d.estimated ? 'badge bk-est' : 'badge bk-ok';
 }
 
 // ── TR-55 ─────────────────────────────────────────────
